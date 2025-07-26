@@ -1,0 +1,281 @@
+#!/bin/bash
+
+# Глобальные переменные
+RECURSIVE=true
+SORT="duration"
+FILE_TYPES=("mp4" "avi" "mov" "mkv" "flv" "mp3" "wav" "flac" "m4a" "ogg" "wma" "aac")
+SHOW_FORMAT=false
+TARGET_DIR="."
+VERBOSE=false
+DETAILED_OUTPUT=false
+SORT_SPECIFIED=false
+
+# Функция для отображения справки
+show_help() {
+    echo "Использование: mdur [ПАРАМЕТРЫ] [КАТАЛОГ]"
+    echo "Анализирует длительность медиафайлов (видео/аудио) в указанном каталоге (по умолчанию - текущий)"
+    echo ""
+    echo "Параметры:"
+    echo "  -h, --help      Показать эту справку"
+    echo "  -r, --no-recur  Отключить рекурсивный поиск (только текущий каталог)"
+    echo "  -s, --sort ТИП  Сортировка: n|name (по имени), d|duration (по длительности), f|format (по формату)"
+    echo "  -t, --types СТР Указать типы файлов через запятую (например: mp4,mp3,avi)"
+    echo "  -f, --format    Показывать формат файла в выводе"
+    echo "  -v, --verbose   Подробный вывод (показывать прогресс)"
+    echo ""
+    echo "Примеры:"
+    echo "  mdur                     # Анализ текущего каталога (только общая длительность)"
+    echo "  mdur ~/videos            # Анализ указанного каталога (только общая длительность)"
+    echo "  mdur -s n -f             # Сортировка по имени с форматом (детальный вывод)"
+    echo "  mdur -t mp4,mov -v       # Только MP4/MOV с подробным выводом"
+    exit 0
+}
+
+# Функция преобразования секунд в ЧЧ:ММ:СС
+seconds_to_hms() {
+    local seconds=$1
+    local hours=$((seconds / 3600))
+    local minutes=$(( (seconds % 3600) / 60 ))
+    local secs=$((seconds % 60))
+    printf "%02d:%02d:%02d" "$hours" "$minutes" "$secs"
+}
+
+# Парсинг аргументов
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            show_help
+            ;;
+        -r|--no-recur)
+            RECURSIVE=false
+            DETAILED_OUTPUT=true
+            shift
+            ;;
+        -s|--sort)
+            if [[ ! "$2" =~ ^(n|name|d|duration|f|format)$ ]]; then
+                echo "Ошибка: неверный тип сортировки '$2'" >&2
+                echo "Допустимые значения: n|name, d|duration, f|format" >&2
+                exit 1
+            fi
+
+            # Преобразование коротких параметров в полные
+            case "$2" in
+                n) SORT="name" ;;
+                d) SORT="duration" ;;
+                f) SORT="format" ;;
+                *) SORT="$2" ;;
+            esac
+
+            SORT_SPECIFIED=true
+            DETAILED_OUTPUT=true
+            shift 2
+            ;;
+        -t|--types)
+            if [[ -z "$2" ]]; then
+                echo "Ошибка: не указаны типы файлов для параметра -t" >&2
+                exit 1
+            fi
+            IFS=',' read -ra FILE_TYPES <<< "$2"
+            DETAILED_OUTPUT=true
+            shift 2
+            ;;
+        -f|--format)
+            SHOW_FORMAT=true
+            DETAILED_OUTPUT=true
+            shift
+            ;;
+        -v|--verbose)
+            VERBOSE=true
+            DETAILED_OUTPUT=true
+            shift
+            ;;
+        -*)
+            echo "Ошибка: неизвестный параметр '$1'" >&2
+            show_help
+            ;;
+        *)
+            if [ -d "$1" ]; then
+                TARGET_DIR="$1"
+                shift
+            else
+                echo "Ошибка: '$1' не является каталогом" >&2
+                exit 1
+            fi
+            ;;
+    esac
+done
+
+# Получаем абсолютный путь к каталогу
+if [ -d "$TARGET_DIR" ]; then
+    TARGET_DIR=$(cd "$TARGET_DIR" && pwd)
+else
+    echo "Ошибка: каталог '$TARGET_DIR' не существует или недоступен" >&2
+    exit 1
+fi
+
+# Проверка ffprobe
+if ! command -v ffprobe &> /dev/null; then
+    echo "Ошибка: ffprobe не установлен. Установите ffmpeg:" >&2
+    echo "  Debian/Ubuntu: sudo apt install ffmpeg" >&2
+    echo "  CentOS/RHEL:   sudo yum install ffmpeg" >&2
+    echo "  macOS (Homebrew): brew install ffmpeg" >&2
+    echo "  Arch: sudo pacman -S ffmpeg" >&2
+    echo "  Fedora: sudo dnf install ffmpeg" >&2
+    exit 1
+fi
+
+# Подготовка шаблона для поиска
+find_pattern=""
+for ext in "${FILE_TYPES[@]}"; do
+    [ -n "$find_pattern" ] && find_pattern+=" -o "
+    find_pattern+="-iname *.$ext"
+done
+
+# Опции поиска
+find_opts=()
+$RECURSIVE || find_opts+=("-maxdepth" "1")
+
+# Временные файлы
+temp_file=$(mktemp)
+total_duration=0
+file_count=0
+errors=0
+
+# Поиск и обработка файлов
+if $VERBOSE; then
+    echo "Поиск медиафайлов в '$TARGET_DIR'..."
+    echo "Поддерживаемые форматы: ${FILE_TYPES[*]}"
+    echo "Рекурсивный поиск: $RECURSIVE"
+fi
+
+while IFS= read -r -d $'\0' file; do
+    # Получение длительности
+    duration=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$file" 2>/dev/null)
+
+    if [ -z "$duration" ]; then
+        if $VERBOSE; then
+            echo "  Ошибка: не удалось получить длительность для $file" >&2
+        fi
+        ((errors++))
+        continue
+    fi
+
+    # Проверка и преобразование длительности
+    if ! [[ "$duration" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        if $VERBOSE; then
+            echo "  Ошибка: некорректная длительность '$duration' для $file" >&2
+        fi
+        ((errors++))
+        continue
+    fi
+
+    # Округление до целых секунд
+    seconds=$(printf "%.0f" "$duration" 2>/dev/null)
+    if [ -z "$seconds" ] || [ "$seconds" -lt 0 ]; then
+        if $VERBOSE; then
+            echo "  Ошибка: некорректное значение секунд '$seconds' для $file" >&2
+        fi
+        ((errors++))
+        continue
+    fi
+
+    filename=$(basename "$file")
+    extension="${filename##*.}"
+
+    # Обновление счетчиков
+    ((file_count++))
+    total_duration=$((total_duration + seconds))
+
+    # Для детального вывода сохраняем данные
+    if $DETAILED_OUTPUT; then
+        printf "%d\t%s\t%s\n" "$seconds" "$extension" "$filename" >> "$temp_file"
+    fi
+
+    if $VERBOSE && ((file_count % 20 == 0)); then
+        echo "  Обработано файлов: $file_count"
+    fi
+done < <(find "$TARGET_DIR" "${find_opts[@]}" \( $find_pattern \) -print0 2>/dev/null)
+
+# Проверка результатов
+if ((file_count == 0)); then
+    if ((errors > 0)); then
+        echo "Ошибка: не удалось обработать ни одного файла (всего ошибок: $errors)" >&2
+    else
+        echo "Не найдено поддерживаемых медиафайлов в каталоге '$TARGET_DIR'"
+    fi
+    rm -f "$temp_file"
+    exit 0
+fi
+
+# Краткий вывод (только общая информация)
+if ! $DETAILED_OUTPUT; then
+    echo "Общая длительность: $(seconds_to_hms "$total_duration")"
+    echo "Файлов: $file_count"
+    if ((errors > 0)); then
+        echo "Файлов с ошибками: $errors"
+    fi
+    rm -f "$temp_file"
+    exit 0
+fi
+
+# Детальный вывод
+if $VERBOSE; then
+    echo "Успешно обработано файлов: $file_count"
+    if ((errors > 0)); then
+        echo "Файлов с ошибками: $errors"
+    fi
+fi
+
+# Сортировка результатов
+case "$SORT" in
+    name|n)
+        sort_cmd="sort -t$'\t' -k3"
+        sort_name="по имени"
+        ;;
+    duration|d)
+        sort_cmd="sort -t$'\t' -k1nr"
+        sort_name="по длительности"
+        ;;
+    format|f)
+        sort_cmd="sort -t$'\t' -k2,2 -k1,1nr"
+        sort_name="по формату"
+        ;;
+esac
+
+# Форматирование вывода
+echo ""
+echo "Анализ медиафайлов в: $TARGET_DIR"
+echo "Сортировка: $sort_name"
+echo "Файлов: $file_count, Общая длительность: $(seconds_to_hms "$total_duration")"
+echo ""
+
+# Заголовки таблицы
+if $SHOW_FORMAT; then
+    echo "Длительность   Формат  Имя файла"
+    echo "--------------------------------"
+else
+    echo "Длительность   Имя файла"
+    echo "------------------------"
+fi
+
+# Вывод отсортированных результатов
+eval "$sort_cmd" "$temp_file" | while IFS=$'\t' read -r seconds extension filename; do
+    hms=$(seconds_to_hms "$seconds")
+
+    if $SHOW_FORMAT; then
+        printf "%12s  %-6s  %s\n" "$hms" "$extension" "$filename"
+    else
+        printf "%12s  %s\n" "$hms" "$filename"
+    fi
+done
+
+# Удаление временного файла
+rm -f "$temp_file"
+
+# Вывод итогов
+if ((errors > 0)); then
+    echo ""
+    echo "Внимание: не удалось обработать $errors файлов (см. подробный вывод с -v)"
+fi
+
+exit 0
