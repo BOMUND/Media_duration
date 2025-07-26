@@ -1,0 +1,62 @@
+### Общие файлы ###
+
+# Временные файлы
+*.tmp
+*.temp
+*.log
+*.bak
+
+# Файлы редакторов
+*~
+*.swp
+*.swo
+
+# Системные файлы macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+
+# Системные файлы Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# Архивы и сжатые файлы
+*.zip
+*.rar
+*.tar.gz
+*.7z
+
+### Спешл фор `mdur` ###
+
+# Исполняемые файлы, созданные при тестировании
+mdur
+/usr/local/bin/mdur
+
+# Папки сборки и установки (если появятся)
+build/
+dist/
+release/
+
+# Пакеты (если сделаю делать .deb, .rpm и т.д.)
+*.deb
+*.rpm
+*.pkg
+
+# Автогенерируемые файлы документации (если будут)
+docs/_build/
+
+# Персональные настройки (если кто-то будет дописывать скрипт <3 )
+.env
+config.local
+
+# Файлы, созданные при тестировании скрипта
+test_output/
+media_test_files/
+
+# Логи установки (если сделаю в install.sh логи)
+install.log
