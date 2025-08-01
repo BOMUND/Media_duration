@@ -3,12 +3,18 @@
 # Глобальные переменные
 RECURSIVE=true
 SORT="duration"
-FILE_TYPES=("mp4" "avi" "mov" "mkv" "flv" "mp3" "wav" "flac" "m4a" "ogg" "wma" "aac")
+FILE_TYPES=("mp4" "avi" "mov" "mkv" "flv" "webm" "m4v" "3gp" "wmv" "mp3" "wav" "flac" "m4a" "ogg" "wma" "aac" "opus" "alac" "aiff" "mid" "amr" )
 SHOW_FORMAT=false
 TARGET_DIR="."
 VERBOSE=false
 DETAILED_OUTPUT=false
 SORT_SPECIFIED=false
+
+# Добавляем обработку сигналов для очистки временных файлов
+cleanup() {
+    rm -f "$temp_file" "$error_log" "$file_list" 2>/dev/null
+}
+trap cleanup EXIT
 
 # Функция для отображения справки
 show_help() {
@@ -31,13 +37,43 @@ show_help() {
     exit 0
 }
 
-# Функция преобразования секунд в ЧЧ:ММ:СС
+# Функция преобразования секунд в ЧЧ:ММ:СС (для отдельных файлов)
 seconds_to_hms() {
     local seconds=$1
     local hours=$((seconds / 3600))
     local minutes=$(( (seconds % 3600) / 60 ))
     local secs=$((seconds % 60))
     printf "%02d:%02d:%02d" "$hours" "$minutes" "$secs"
+}
+
+# Функция преобразования секунд в расширенный формат (для общей длительности)
+seconds_to_extended() {
+    local total_seconds=$1
+    local seconds=$((total_seconds % 60))
+    local minutes=$(( (total_seconds / 60) % 60 ))
+    local hours=$(( (total_seconds / 3600) % 24 ))
+    local days=$(( (total_seconds / 86400) % 30 ))
+    local months=$((total_seconds / 2592000))  # 30 дней в месяце
+    local result=""
+    # Добавляем месяцы, если есть
+    if [ "$months" -gt 0 ]; then
+        result="${months}m "
+    fi
+    # Добавляем дни, если есть или если есть месяцы
+    if [ "$days" -gt 0 ] || [ "$months" -gt 0 ]; then
+        result="${result}${days}d "
+    fi
+    # Добавляем часы, если есть или если есть дни/месяцы
+    if [ "$hours" -gt 0 ] || [ "$days" -gt 0 ] || [ "$months" -gt 0 ]; then
+        result="${result}${hours}h "
+    fi
+    # Добавляем минуты, если есть или если есть часы/дни/месяцы
+    if [ "$minutes" -gt 0 ] || [ "$hours" -gt 0 ] || [ "$days" -gt 0 ] || [ "$months" -gt 0 ]; then
+        result="${result}${minutes}m "
+    fi
+    # Всегда добавляем секунды
+    result="${result}${seconds}s"
+    echo "$result"
 }
 
 # Парсинг аргументов
@@ -48,7 +84,6 @@ while [[ $# -gt 0 ]]; do
             ;;
         -r|--no-recur)
             RECURSIVE=false
-            DETAILED_OUTPUT=true
             shift
             ;;
         -s|--sort)
@@ -57,7 +92,6 @@ while [[ $# -gt 0 ]]; do
                 echo "Допустимые значения: n|name, d|duration, f|format" >&2
                 exit 1
             fi
-
             # Преобразование коротких параметров в полные
             case "$2" in
                 n) SORT="name" ;;
@@ -65,7 +99,6 @@ while [[ $# -gt 0 ]]; do
                 f) SORT="format" ;;
                 *) SORT="$2" ;;
             esac
-
             SORT_SPECIFIED=true
             DETAILED_OUTPUT=true
             shift 2
@@ -76,7 +109,6 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             IFS=',' read -ra FILE_TYPES <<< "$2"
-            DETAILED_OUTPUT=true
             shift 2
             ;;
         -f|--format)
@@ -86,7 +118,6 @@ while [[ $# -gt 0 ]]; do
             ;;
         -v|--verbose)
             VERBOSE=true
-            DETAILED_OUTPUT=true
             shift
             ;;
         -*)
@@ -117,26 +148,30 @@ fi
 if ! command -v ffprobe &> /dev/null; then
     echo "Ошибка: ffprobe не установлен. Установите ffmpeg:" >&2
     echo "  Debian/Ubuntu: sudo apt install ffmpeg" >&2
-    echo "  CentOS/RHEL:   sudo yum install ffmpeg" >&2
+    echo "  CentOS/RHEL/Fedora: sudo dnf install ffmpeg" >&2
     echo "  macOS (Homebrew): brew install ffmpeg" >&2
     echo "  Arch: sudo pacman -S ffmpeg" >&2
     echo "  Fedora: sudo dnf install ffmpeg" >&2
     exit 1
 fi
 
-# Подготовка шаблона для поиска
-find_pattern=""
+# Подготовка аргументов для поиска
+find_args=()
 for ext in "${FILE_TYPES[@]}"; do
-    [ -n "$find_pattern" ] && find_pattern+=" -o "
-    find_pattern+="-iname *.$ext"
+    find_args+=("-name" "*.${ext}" "-o")
 done
+# Удаляем последний "-o"
+unset 'find_args[${#find_args[@]}-1]'
 
 # Опции поиска
 find_opts=()
-$RECURSIVE || find_opts+=("-maxdepth" "1")
+[ "$RECURSIVE" = false ] && find_opts+=("-maxdepth" "1")
 
 # Временные файлы
 temp_file=$(mktemp)
+error_log=$(mktemp)
+
+# Счетчики
 total_duration=0
 file_count=0
 errors=0
@@ -148,13 +183,33 @@ if $VERBOSE; then
     echo "Рекурсивный поиск: $RECURSIVE"
 fi
 
-while IFS= read -r -d $'\0' file; do
-    # Получение длительности
-    duration=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$file" 2>/dev/null)
+# Сначала получаем список файлов
+file_list=$(mktemp)
+find "$TARGET_DIR" "${find_opts[@]}" \( "${find_args[@]}" \) -print0 2>/dev/null > "$file_list"
 
+# Подсчитываем общее количество файлов для прогресса
+total_files=$(tr '\0' '\n' < "$file_list" | wc -l)
+if $VERBOSE; then
+    echo "Найдено файлов: $total_files"
+fi
+
+# Обрабатываем файлы
+current_count=0
+while IFS= read -r -d $'\0' file; do
+    ((current_count++))
+
+    # Проверка прав доступа
+    if [ ! -r "$file" ]; then
+        echo "Ошибка: нет прав на чтение файла: $file" >> "$error_log"
+        ((errors++))
+        continue
+    fi
+
+    # Получение длительности
+    duration=$(ffprobe -v quiet -show_entries format=duration -of default=nw=1:nk=1 "$file" 2>/dev/null)
     if [ -z "$duration" ]; then
         if $VERBOSE; then
-            echo "  Ошибка: не удалось получить длительность для $file" >&2
+            echo "Не удалось получить длительность: $file" >> "$error_log"
         fi
         ((errors++))
         continue
@@ -163,18 +218,27 @@ while IFS= read -r -d $'\0' file; do
     # Проверка и преобразование длительности
     if ! [[ "$duration" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
         if $VERBOSE; then
-            echo "  Ошибка: некорректная длительность '$duration' для $file" >&2
+            echo "Некорректная длительность '$duration': $file" >> "$error_log"
         fi
         ((errors++))
         continue
     fi
 
-    # Округление до целых секунд
-    seconds=$(printf "%.0f" "$duration" 2>/dev/null)
-    if [ -z "$seconds" ] || [ "$seconds" -lt 0 ]; then
+    # Округление до целых секунд с использованием awk
+    seconds=$(awk "BEGIN {print int($duration + 0.5)}" 2>/dev/null)
+
+    # Проверка, что seconds является корректным числом
+    if ! [[ "$seconds" =~ ^[0-9]+$ ]] || [ "$seconds" -lt 0 ]; then
         if $VERBOSE; then
-            echo "  Ошибка: некорректное значение секунд '$seconds' для $file" >&2
+            echo "Некорректное значение секунд '$seconds': $file" >> "$error_log"
         fi
+        ((errors++))
+        continue
+    fi
+
+    # Проверка на нулевую длительность
+    if [ "$seconds" -eq 0 ]; then
+        echo "Предупреждение: файл с нулевой длительностью: $file" >> "$error_log"
         ((errors++))
         continue
     fi
@@ -191,53 +255,82 @@ while IFS= read -r -d $'\0' file; do
         printf "%d\t%s\t%s\n" "$seconds" "$extension" "$filename" >> "$temp_file"
     fi
 
-    if $VERBOSE && ((file_count % 20 == 0)); then
-        echo "  Обработано файлов: $file_count"
+    # Показываем прогресс каждые 50 файлов
+    if $VERBOSE && ((current_count % 50 == 0 || current_count == total_files)); then
+        if [ "$total_files" -gt 0 ]; then
+            percent=$((current_count * 100 / total_files))
+            echo "  Обработано: $current_count/$total_files ($percent%)"
+        else
+            echo "  Обработано файлов: $current_count"
+        fi
     fi
-done < <(find "$TARGET_DIR" "${find_opts[@]}" \( $find_pattern \) -print0 2>/dev/null)
+done < "$file_list"
+
+# Очищаем временный файл списка
+rm -f "$file_list"
 
 # Проверка результатов
 if ((file_count == 0)); then
     if ((errors > 0)); then
         echo "Ошибка: не удалось обработать ни одного файла (всего ошибок: $errors)" >&2
+        if $VERBOSE; then
+            echo "Подробности ошибок:" >&2
+            head -20 "$error_log" >&2
+            if [ "$(wc -l < "$error_log")" -gt 20 ]; then
+                echo "... (показаны первые 20 ошибок, всего: $(wc -l < "$error_log"))" >&2
+            fi
+        fi
     else
         echo "Не найдено поддерживаемых медиафайлов в каталоге '$TARGET_DIR'"
     fi
-    rm -f "$temp_file"
+    rm -f "$temp_file" "$error_log"
     exit 0
 fi
 
 # Краткий вывод (только общая информация)
 if ! $DETAILED_OUTPUT; then
-    echo "Общая длительность: $(seconds_to_hms "$total_duration")"
+    echo "Общая длительность: $(seconds_to_extended "$total_duration")"
     echo "Файлов: $file_count"
     if ((errors > 0)); then
         echo "Файлов с ошибками: $errors"
+        if $VERBOSE; then
+            echo "Подробности ошибок:"
+            head -10 "$error_log"
+            if [ "$(wc -l < "$error_log")" -gt 10 ]; then
+                echo "... (показаны первые 10 ошибок из $(wc -l < "$error_log"))"
+            fi
+        fi
     fi
-    rm -f "$temp_file"
+    rm -f "$temp_file" "$error_log"
     exit 0
 fi
 
 # Детальный вывод
 if $VERBOSE; then
+    echo ""
     echo "Успешно обработано файлов: $file_count"
     if ((errors > 0)); then
         echo "Файлов с ошибками: $errors"
+        echo "Подробности ошибок:"
+        head -10 "$error_log"
+        if [ "$(wc -l < "$error_log")" -gt 10 ]; then
+            echo "... (показаны первые 10 ошибок из $(wc -l < "$error_log"))"
+        fi
     fi
 fi
 
 # Сортировка результатов
 case "$SORT" in
     name|n)
-        sort_cmd="sort -t$'\t' -k3"
+        sort_cmd="LC_ALL=C sort -t$'\t' -k3"
         sort_name="по имени"
         ;;
     duration|d)
-        sort_cmd="sort -t$'\t' -k1nr"
+        sort_cmd="LC_ALL=C sort -t$'\t' -k1nr"
         sort_name="по длительности"
         ;;
     format|f)
-        sort_cmd="sort -t$'\t' -k2,2 -k1,1nr"
+        sort_cmd="LC_ALL=C sort -t$'\t' -k2,2 -k1,1nr"
         sort_name="по формату"
         ;;
 esac
@@ -246,34 +339,33 @@ esac
 echo ""
 echo "Анализ медиафайлов в: $TARGET_DIR"
 echo "Сортировка: $sort_name"
-echo "Файлов: $file_count, Общая длительность: $(seconds_to_hms "$total_duration")"
+echo "Файлов: $file_count, Общая длительность: $(seconds_to_extended "$total_duration")"
 echo ""
 
 # Заголовки таблицы
 if $SHOW_FORMAT; then
-    echo "Длительность   Формат  Имя файла"
-    echo "--------------------------------"
+    printf "%-12s  %-6s  %s\n" "Длительность" "Формат" "Имя файла"
+    echo "----------------------------------------"
 else
-    echo "Длительность   Имя файла"
-    echo "------------------------"
+    printf "%-12s  %s\n" "Длительность" "Имя файла"
+    echo "----------------------------"
 fi
 
 # Вывод отсортированных результатов
 eval "$sort_cmd" "$temp_file" | while IFS=$'\t' read -r seconds extension filename; do
     hms=$(seconds_to_hms "$seconds")
-
     if $SHOW_FORMAT; then
-        printf "%12s  %-6s  %s\n" "$hms" "$extension" "$filename"
+        printf "%-12s  %-6s  %s\n" "$hms" "$extension" "$filename"
     else
-        printf "%12s  %s\n" "$hms" "$filename"
+        printf "%-12s  %s\n" "$hms" "$filename"
     fi
 done
 
-# Удаление временного файла
-rm -f "$temp_file"
+# Удаление временных файлов
+rm -f "$temp_file" "$error_log"
 
 # Вывод итогов
-if ((errors > 0)); then
+if ((errors > 0)) && ! $VERBOSE; then
     echo ""
     echo "Внимание: не удалось обработать $errors файлов (см. подробный вывод с -v)"
 fi
