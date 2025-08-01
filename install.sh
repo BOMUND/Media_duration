@@ -55,7 +55,6 @@ rm -f "$TEMP_FILE"
 # Проверка установки
 if command -v "$SCRIPT_NAME" &> /dev/null; then
     echo "$SCRIPT_NAME успешно установлен в $INSTALL_DIR/$SCRIPT_NAME"
-    echo "Версия: $(mdur --help | head -1)"
     echo "Установка завершена!"
 else
     echo "Ошибка: Установка прошла, но скрипт не найден в PATH" >&2
